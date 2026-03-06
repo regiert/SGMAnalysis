@@ -295,7 +295,8 @@ class MapScan:
             ax_spec.set_xlabel("Bin Number")
             ax_spec.set_ylabel("Total Intensity")
             ax_spec.grid(True)
-                class StackScan:
+
+class StackScan:
     """
     Represents a stack scan from the SGM beamline.
     """

@@ -166,6 +166,19 @@ class MapScan:
         if self.x.size == 0 or self.y.size == 0:
             print("Error: Coordinate data not found.", file=sys.stderr)
             return
+        
+        x_min, x_max = self.x.min(), self.x.max()
+        y_min, y_max = self.y.min(), self.y.max()
+
+        if map_roi is None:
+            map_roi = [x_min, x_max, y_min, y_max]
+        else:
+            user_x1, user_x2 = sorted(map_roi[0:2])
+            user_y1, user_y2 = sorted(map_roi[2:4])
+            map_roi = [
+                max(user_x1, x_min), min(user_x2, x_max),
+                max(user_y1, y_min), min(user_y2, y_max)
+            ]
 
         num_detectors = len(self.sdd_files)
         
@@ -235,11 +248,10 @@ class MapScan:
                 tripcolor = ax_map.tripcolor(current_x, current_y, intensity, shading='gouraud', **plot_kwargs)
                 fig.colorbar(tripcolor, ax=ax_map, label=f"Counts (ROI: {channel_roi[0]}-{channel_roi[1]})")
             
-            if map_roi:
-                x1, x2 = sorted(map_roi[0:2])
-                y1, y2 = sorted(map_roi[2:4])
-                rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor='r', facecolor='none', linestyle='--')
-                ax_map.add_patch(rect)
+            x1, x2 = sorted(map_roi[0:2])
+            y1, y2 = sorted(map_roi[2:4])
+            rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor='r', facecolor='none', linestyle='--')
+            ax_map.add_patch(rect)
 
             ax_map.set_title(f"{detector_name} - ROI Map")
             ax_map.set_xlabel("Hexapod X")
@@ -400,7 +412,7 @@ class StackScan:
             print(f"Error reading SDD data for {detector_name} at {energy} eV: {e}", file=sys.stderr)
             return None
 
-    def plot_summary(self, channel_roi, map_roi, roll_shift=0, as_scatter_plot: bool = False, contrast=None, mcc_channels=None, sdd_detectors_to_plot=None):
+    def plot_summary(self, channel_roi, map_roi=None, roll_shift=0, as_scatter_plot: bool = False, contrast=None, mcc_channels=None, sdd_detectors_to_plot=None, xeol_roi=None, dump_csv=None):
         if not self.sdd_files:
             print("Error: No SDD files found.", file=sys.stderr)
             return
@@ -415,7 +427,21 @@ class StackScan:
         
         summary_data = {det: [] for det in detector_names}
         mcc_summary_data = {ch: [] for ch in mcc_channels} if mcc_channels else {}
+        xeol_summary_data = []
         summary_energies = []
+
+        if self.x.size > 0 and self.y.size > 0:
+            x_min, x_max = self.x.min(), self.x.max()
+            y_min, y_max = self.y.min(), self.y.max()
+            if map_roi is None:
+                map_roi = [x_min, x_max, y_min, y_max]
+            else:
+                user_x1, user_x2 = sorted(map_roi[0:2])
+                user_y1, user_y2 = sorted(map_roi[2:4])
+                map_roi = [
+                    max(user_x1, x_min), min(user_x2, x_max),
+                    max(user_y1, y_min), min(user_y2, y_max)
+                ]
 
         x1_map, x2_map = sorted(map_roi[0:2])
         y1_map, y2_map = sorted(map_roi[2:4])
@@ -440,11 +466,57 @@ class StackScan:
                         mcc_summary_data[mcc_channel].append(np.mean(self.mcc_data[energy][spatial_mask, channel_index]))
                     except (ValueError, IndexError):
                         mcc_summary_data[mcc_channel].append(np.nan)
-            
+
+            if xeol_roi and self.xeol_data.get(energy) is not None:
+                xeol_summary_data.append(np.sum(self.xeol_data[energy][xeol_roi[0]:xeol_roi[1]]))
+
             if intensity_found:
                 summary_energies.append(energy)
         
-        threshold_energy = all_energies[len(all_energies) // 2] 
+        if dump_csv:
+            header = ["Energy"] + detector_names
+            data_columns = [summary_energies] + [summary_data[d] for d in detector_names]
+            
+            fmt_list = ['%.4f']  # Format for energy
+            fmt_list.extend(['%d'] * len(detector_names))  # Format for SDD data
+            
+            if xeol_roi and xeol_summary_data:
+                header.append("XEOL_ROI")
+                data_columns.append(xeol_summary_data)
+                fmt_list.append('%d') # Format for XEOL data
+            
+            output_data = np.array(data_columns).T
+            np.savetxt(dump_csv, output_data, delimiter=',', header=','.join(header), comments='', fmt=fmt_list)
+
+        # --- Determine Threshold Energy ---
+        if len(summary_energies) > 5:
+            # Use the first detector with valid data to find the absorption edge
+            primary_detector_data = np.array(summary_data[detector_names[0]])
+            valid_indices = ~np.isnan(primary_detector_data)
+            energies = np.array(summary_energies)[valid_indices]
+            spectrum = primary_detector_data[valid_indices]
+
+            if len(energies) > 5:
+                # Smooth the spectrum with a moving average of 3 points
+                smoothed_spectrum = np.convolve(spectrum, np.ones(3)/3, mode='valid')
+                smoothed_energies = energies[1:-1] # Adjust energies for smoothed data
+
+                if len(smoothed_energies) > 1:
+                    # Calculate the first derivative to find the point of max intensity rise
+                    derivative = np.gradient(smoothed_spectrum, smoothed_energies)
+                    
+                    # The index of the max derivative corresponds to the absorption edge
+                    max_derivative_index = np.argmax(derivative)
+                    threshold_energy = smoothed_energies[max_derivative_index]
+                else:
+                    # Fallback for very short scans or scans with lots of NaNs
+                    threshold_energy = all_energies[len(all_energies) // 2]
+            else:
+                # Fallback for very short scans or scans with lots of NaNs
+                threshold_energy = all_energies[len(all_energies) // 2]
+        else:
+            # Fallback for very short scans
+            threshold_energy = all_energies[len(all_energies) // 2]
 
         averaged_maps = {det: {'before': {'sum': None, 'count': 0}, 'after': {'sum': None, 'count': 0}} for det in detector_names}
         for energy in all_energies:
@@ -471,7 +543,7 @@ class StackScan:
                     final_maps[det_name][period] = None
 
         num_detectors = len(detector_names)
-        num_summary_plots = 1 + (1 if mcc_channels else 0) + (1 if self.xeol_data else 0)
+        num_summary_plots = 1 + (1 if mcc_channels else 0) + (1 if self.xeol_data else 0) + (1 if xeol_roi else 0)
         fig = plt.figure(figsize=(18, 5 * num_detectors + 5 * num_summary_plots))
         gs = gridspec.GridSpec(num_detectors + num_summary_plots, 3, figure=fig, height_ratios=[1] * num_detectors + [2] * num_summary_plots)
         
@@ -496,6 +568,11 @@ class StackScan:
                     ax.set_title(f"{det_name} - No data {period} threshold")
                 ax.set_xlabel("Hexapod X"); ax.set_ylabel("Hexapod Y")
                 ax.set_aspect('equal', adjustable='box')
+
+                x1, x2 = sorted(map_roi[0:2])
+                y1, y2 = sorted(map_roi[2:4])
+                rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1.5, edgecolor='r', facecolor='none', linestyle='--')
+                ax.add_patch(rect)
 
             representative_energy = min(summary_energies, key=lambda x: abs(x - threshold_energy)) if summary_energies else None
             if representative_energy:
@@ -531,14 +608,59 @@ class StackScan:
         if self.xeol_data:
             xeol_energies = sorted(self.xeol_data.keys())
             if xeol_energies:
+                # --- Calculate summed and averaged XEOL spectra ---
+                first_spec_shape = self.xeol_data[xeol_energies[0]].shape
+                sum_below, sum_above = np.zeros(first_spec_shape), np.zeros(first_spec_shape)
+                count_below, count_above = 0, 0
+                
+                for energy, spectrum in self.xeol_data.items():
+                    if energy < threshold_energy:
+                        sum_below += spectrum
+                        count_below += 1
+                    else:
+                        sum_above += spectrum
+                        count_above += 1
+                
+                # Avoid division by zero
+                avg_below = sum_below / count_below if count_below > 0 else sum_below
+                avg_above = sum_above / count_above if count_above > 0 else sum_above
+
+                # --- Create new layout for XEOL plots ---
+                ax_summed_xeol = fig.add_subplot(gs[summary_plot_index, 0])
+                ax_xeol_vs_energy = fig.add_subplot(gs[summary_plot_index, 1:])
+                summary_plot_index += 1
+
+                # --- Plot averaged spectra (left) ---
+                ax_summed_xeol.plot(avg_below, label=f'Avg. Below {threshold_energy:.2f} eV')
+                ax_summed_xeol.plot(avg_above, label=f'Avg. Above {threshold_energy:.2f} eV')
+                ax_summed_xeol.set_title("Averaged XEOL Spectra")
+                ax_summed_xeol.set_xlabel("XEOL Bin Number")
+                ax_summed_xeol.set_ylabel("Average Intensity")
+                ax_summed_xeol.legend()
+                ax_summed_xeol.grid(True)
+
+                # --- Plot XEOL vs Energy (right) ---
                 xeol_stack = np.array([self.xeol_data[en] for en in xeol_energies])
-                ax_xeol = fig.add_subplot(gs[summary_plot_index, :])
-                im = ax_xeol.imshow(xeol_stack.T, aspect='auto', extent=[min(xeol_energies), max(xeol_energies), 0, xeol_stack.shape[1]], origin='lower', cmap='viridis')
-                fig.colorbar(im, ax=ax_xeol, label="Intensity")
-                ax_xeol.set_title("XEOL Spectrum vs. Excitation Energy")
-                ax_xeol.set_xlabel("Energy (eV)"); ax_xeol.set_ylabel("XEOL Bin Number")
+                im = ax_xeol_vs_energy.imshow(xeol_stack.T, aspect='auto', extent=[min(xeol_energies), max(xeol_energies), 0, xeol_stack.shape[1]], origin='lower', cmap='viridis')
+                if xeol_roi:
+                    ax_xeol_vs_energy.axhline(y=xeol_roi[0], color='r', linestyle=':')
+                    ax_xeol_vs_energy.axhline(y=xeol_roi[1], color='r', linestyle=':')
+                fig.colorbar(im, ax=ax_xeol_vs_energy, label="Intensity")
+                ax_xeol_vs_energy.set_title("XEOL Spectrum vs. Excitation Energy")
+                ax_xeol_vs_energy.set_xlabel("Energy (eV)")
+
+        if xeol_roi and xeol_summary_data:
+            ax_xeol_summary = fig.add_subplot(gs[summary_plot_index, :])
+            ax_xeol_summary.plot(summary_energies, xeol_summary_data, 'o-')
+            ax_xeol_summary.set_title(f"XEOL Intensity vs. Energy (ROI: {xeol_roi[0]}-{xeol_roi[1]})")
+            ax_xeol_summary.set_xlabel("Energy (eV)")
+            ax_xeol_summary.set_ylabel("Total XEOL Intensity in ROI")
+            ax_xeol_summary.grid(True)
+
 
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.show()
+
+
 
 

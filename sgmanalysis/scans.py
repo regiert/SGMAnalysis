@@ -6,6 +6,9 @@ import glob
 import sys
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 class MapScan:
     """
@@ -390,6 +393,287 @@ class StackScan:
                     xeol_file_path = xeol_files_list[0]
                     self.xeol_files[energy] = xeol_file_path
                     self.xeol_data[energy] = np.fromfile(xeol_file_path, dtype=np.uint32)
+
+    def _get_marker_size(self, y_coords, plot_width_inches=5):
+        """Heuristic to determine scatter plot marker size to form a contiguous grid."""
+        if len(y_coords) < 2:
+            return 10
+        try:
+            rounded_y = np.round(y_coords, 3) 
+            _, y_counts = np.unique(rounded_y, return_counts=True)
+            if len(y_counts) > 1:
+                width_in_pixels = int(max(set(y_counts), key=list(y_counts).count))
+                if width_in_pixels > 0:
+                    marker_side_points = (plot_width_inches * 72) / width_in_pixels
+                    return marker_side_points ** 2
+        except Exception:
+            return 10
+        return 10
+
+    def analyze_pca_kmeans(self, detector_names, channel_roi, n_clusters=4, n_components=4, normalize=True):
+        """
+        Performs PCA and K-Means clustering on the pixel spectra, optionally using multiple detectors.
+
+        Args:
+            detector_names (str or list): Name of a single detector or a list of detector names.
+            channel_roi (tuple): A tuple of two integers defining the ROI of the spectrum.
+            n_clusters (int): The number of clusters for K-Means. Defaults to 4.
+            n_components (int): The number of principal components for PCA. Defaults to 4.
+            normalize (bool): Whether to normalize the spectra using StandardScaler. Defaults to True.
+
+        Returns:
+            dict: Analysis results including PCA components, labels, and cluster PFYs.
+        """
+        if isinstance(detector_names, str):
+            detector_names = [detector_names]
+
+        # Filter for valid detectors present in this stack
+        valid_detectors = [d for d in detector_names if d in self.sdd_files]
+        if not valid_detectors:
+            print(f"Error: None of the specified detectors {detector_names} found.", file=sys.stderr)
+            return None
+
+        # Identify energies consistent across ALL selected detectors
+        good_energies = []
+        num_pixels = -1
+        for energy in sorted(self.energies):
+            is_energy_valid = True
+            current_energy_pixels = -1
+            
+            for det in valid_detectors:
+                sdd_filepath = self.sdd_files[det].get(energy)
+                if not sdd_filepath or not os.path.exists(sdd_filepath):
+                    is_energy_valid = False
+                    break
+                
+                pixels_per_spectrum = 256
+                det_pixels = os.path.getsize(sdd_filepath) // (4 * pixels_per_spectrum)
+                if current_energy_pixels == -1:
+                    current_energy_pixels = det_pixels
+                elif det_pixels != current_energy_pixels:
+                    is_energy_valid = False
+                    break
+            
+            if is_energy_valid:
+                if num_pixels == -1:
+                    num_pixels = current_energy_pixels
+                if current_energy_pixels == num_pixels:
+                    good_energies.append(energy)
+        
+        if not good_energies or num_pixels <= 0:
+            print(f"Error: No consistent data found across detectors {valid_detectors}.", file=sys.stderr)
+            return None
+
+        # Build concatenated pixel spectra matrix: (num_pixels, num_detectors * num_energies)
+        num_en = len(good_energies)
+        pixel_spectra_concatenated = np.zeros((num_pixels, len(valid_detectors) * num_en))
+        
+        # We also keep a summed version for the final PFY plot (easier to read)
+        pixel_spectra_summed = np.zeros((num_pixels, num_en))
+
+        for d_idx, det in enumerate(valid_detectors):
+            for e_idx, energy in enumerate(good_energies):
+                spectra_2d = self.get_sdd_data(det, energy)
+                if spectra_2d is not None:
+                    intensity = np.sum(spectra_2d[:, channel_roi[0]:channel_roi[1]], axis=1)
+                    pixel_spectra_concatenated[:, d_idx * num_en + e_idx] = intensity
+                    pixel_spectra_summed[:, e_idx] += intensity
+
+        if np.sum(np.nan_to_num(pixel_spectra_concatenated)) == 0:
+            print(f"Error: Zero total intensity in the selected ROI.", file=sys.stderr)
+            return None
+
+        # --- Data Validation & Preprocessing ---
+        # 1. Cast to float64 and handle NaNs/Infs
+        data = np.nan_to_num(pixel_spectra_concatenated.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+
+        # 2. Remove constant columns (zero variance) which cause issues in PCA/scaling
+        variances = np.var(data, axis=0)
+        non_constant_cols = variances > 0
+        if not np.any(non_constant_cols):
+            print("Error: All data columns are constant. Cannot perform PCA.", file=sys.stderr)
+            return None
+        
+        data = data[:, non_constant_cols]
+
+        # 3. Normalize (StandardScaler)
+        if normalize:
+            scaler = StandardScaler()
+            processed_data = scaler.fit_transform(data)
+        else:
+            # Mean center at minimum
+            processed_data = data - np.mean(data, axis=0)
+
+        # --- PCA ---
+        n_comp = min(n_components, processed_data.shape[1])
+        pca = PCA(n_components=n_comp)
+        pca_result = pca.fit_transform(processed_data)
+
+        # --- K-Means ---
+        kmeans = KMeans(n_clusters=n_clusters, random_state=0, n_init=10)
+        labels = kmeans.fit_predict(pca_result)
+
+        # --- Re-label clusters by size ---
+        cluster_sizes = np.bincount(labels, minlength=n_clusters)
+        sorted_indices = np.argsort(cluster_sizes)[::-1]
+        remapping = np.zeros(n_clusters, dtype=int)
+        for i, original_index in enumerate(sorted_indices):
+            remapping[original_index] = i
+        relabeled_labels = remapping[labels]
+
+        # --- Calculate Cluster PFYs (using the summed data for visualization) ---
+        cluster_pfys = {}
+        for i in range(n_clusters):
+            cluster_indices = np.where(relabeled_labels == i)[0]
+            if len(cluster_indices) > 0:
+                cluster_pfys[i] = np.mean(pixel_spectra_summed[cluster_indices, :], axis=0)
+
+        return {
+            'pca': pca,
+            'pca_result': pca_result,
+            'labels': relabeled_labels,
+            'energies': np.array(good_energies),
+            'cluster_pfys': cluster_pfys,
+            'detectors_used': valid_detectors,
+            'channel_roi': channel_roi
+        }
+
+    def plot_pca_kmeans(self, results, detector_names=None, roll_shift=0, outfile=None):
+        """
+        Plots the results of the PCA and K-Means clustering.
+
+        Args:
+            results (dict): The results dictionary returned by analyze_pca_kmeans.
+            detector_names (str or list, optional): Detectors to use for the PFY plot. 
+                                                   If None, uses the detectors from the analysis.
+            roll_shift (int): The number of positions to shift the data for roll correction.
+            outfile (str, optional): Base filename to save the results as CSV. 
+                                     Saves spatial data to <outfile>.csv and 
+                                     spectra to <outfile>_spectra.csv.
+        """
+        if results is None:
+            return
+
+        pca_result = results['pca_result']
+        labels = results['labels']
+        energies = results['energies']
+        pca = results['pca']
+        channel_roi = results['channel_roi']
+        
+        # Apply roll shift for spatial visualization
+        if roll_shift != 0:
+            labels = np.roll(labels, shift=roll_shift)
+            pca_result = np.roll(pca_result, shift=roll_shift, axis=0)
+
+        # Determine which detectors to plot PFY for
+        if detector_names is not None:
+            if isinstance(detector_names, str):
+                detector_names = [detector_names]
+            
+            # Recalculate PFY for the selected detectors based on the existing labels
+            n_clusters = len(np.unique(labels))
+            num_pixels = len(labels)
+            pixel_spectra_summed = np.zeros((num_pixels, len(energies)))
+            
+            valid_plot_detectors = []
+            for det in detector_names:
+                if det in self.sdd_files:
+                    valid_plot_detectors.append(det)
+                    for e_idx, energy in enumerate(energies):
+                        spectra_2d = self.get_sdd_data(det, energy)
+                        if spectra_2d is not None:
+                            pixel_spectra_summed[:, e_idx] += np.sum(spectra_2d[:, channel_roi[0]:channel_roi[1]], axis=1)
+            
+            plot_pfys = {}
+            for i in range(n_clusters):
+                cluster_indices = np.where(labels == i)[0]
+                if len(cluster_indices) > 0:
+                    plot_pfys[i] = np.mean(pixel_spectra_summed[cluster_indices, :], axis=0)
+            
+            plot_det_label = ", ".join(valid_plot_detectors)
+        else:
+            plot_pfys = results['cluster_pfys']
+            plot_det_label = ", ".join(results.get('detectors_used', []))
+
+        n_clusters = len(plot_pfys)
+
+        fig = plt.figure(figsize=(15, 12))
+        gs = gridspec.GridSpec(3, 3, figure=fig)
+        
+        fig.suptitle(f"PCA & K-Means Analysis: {self.scan_name} (Plotting: {plot_det_label})", fontsize=16)
+
+        plot_x = self.x[:pca_result.shape[0]]
+        plot_y = self.y[:pca_result.shape[0]]
+        marker_s = self._get_marker_size(plot_y)
+
+        # 1. Cluster Map
+        ax_clusters = fig.add_subplot(gs[0, 0])
+        scatter = ax_clusters.scatter(plot_x, plot_y, c=labels, cmap='tab10', marker='s', s=marker_s)
+        ax_clusters.set_title("K-Means Clusters (0=Largest Area)")
+        ax_clusters.set_aspect('equal', adjustable='box')
+        fig.colorbar(scatter, ax=ax_clusters, label="Cluster ID")
+
+        # 2. PCA Components
+        for i in range(min(3, pca.n_components_)):
+            ax_pca = fig.add_subplot(gs[0, i + 1] if i < 2 else gs[1, 0])
+            scatter_pca = ax_pca.scatter(plot_x, plot_y, c=pca_result[:, i], cmap='viridis', marker='s', s=marker_s)
+            ax_pca.set_title(f"PCA Component {i+1}")
+            ax_pca.set_aspect('equal', adjustable='box')
+            fig.colorbar(scatter_pca, ax=ax_pca)
+
+        # 3. Scree Plot
+        ax_scree = fig.add_subplot(gs[1, 1])
+        var_ratio = pca.explained_variance_ratio_
+        ax_scree.bar(range(1, len(var_ratio) + 1), var_ratio)
+        ax_scree.set_title("Explained Variance Ratio")
+        ax_scree.set_xlabel("Principal Component")
+        ax_scree.set_ylabel("Variance Ratio")
+        ax_scree.set_xticks(range(1, len(var_ratio) + 1))
+
+        # 4. Cluster PFY Spectra
+        ax_spec = fig.add_subplot(gs[2, :])
+        for i in range(n_clusters):
+            if i in plot_pfys:
+                spectrum = plot_pfys[i]
+                s_min, s_max = spectrum.min(), spectrum.max()
+                norm_spec = (spectrum - s_min) / (s_max - s_min) if s_max > s_min else spectrum
+                ax_spec.plot(energies, norm_spec, 'o-', label=f"Cluster {i}")
+        
+        ax_spec.set_title(f"Normalized Mean PFY ({plot_det_label}) per Cluster")
+        ax_spec.set_xlabel("Energy (eV)")
+        ax_spec.set_ylabel("Normalized Intensity")
+        ax_spec.legend()
+        ax_spec.grid(True)
+
+        if outfile:
+            # 1. Spatial Data (Pixels)
+            # Make sure extension is .csv
+            base_out = outfile if not outfile.lower().endswith('.csv') else outfile[:-4]
+            spatial_outfile = f"{base_out}.csv"
+            
+            spatial_header = ["x", "y", "cluster_id"]
+            for i in range(pca_result.shape[1]):
+                spatial_header.append(f"pca_{i+1}")
+            
+            spatial_data = np.column_stack([plot_x, plot_y, labels, pca_result])
+            np.savetxt(spatial_outfile, spatial_data, delimiter=',', header=",".join(spatial_header), comments='')
+            
+            # 2. Spectral Data (Clusters)
+            spectra_outfile = f"{base_out}_spectra.csv"
+            spectra_header = ["energy"]
+            spectra_cols = [energies]
+            for i in range(n_clusters):
+                if i in plot_pfys:
+                    spectra_header.append(f"cluster_{i}")
+                    spectra_cols.append(plot_pfys[i])
+            
+            spectra_data = np.column_stack(spectra_cols)
+            np.savetxt(spectra_outfile, spectra_data, delimiter=',', header=",".join(spectra_header), comments='')
+            print(f"PCA/K-Means results dumped to: {spatial_outfile} and {spectra_outfile}")
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
+
     def __repr__(self):
         return (f"StackScan(scan_name='{self.scan_name}', project='{self.project}', "
                 f"energies={len(self.energies)}, detectors={list(self.sdd_files.keys())})")
